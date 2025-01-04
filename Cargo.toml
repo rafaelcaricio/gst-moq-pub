@@ -1,0 +1,71 @@
+[package]
+name = "gst-moq"
+authors = ["Rafael Caricio <rafael@caricio.com>"]
+version = "0.1.0"
+edition = "2021"
+publish = ["crates-io"]
+
+[dependencies]
+gst = { package = "gstreamer", git = "https://gitlab.freedesktop.org/gstreamer/gstreamer-rs", branch = "main" }
+gst-app = { package = "gstreamer-app", git = "https://gitlab.freedesktop.org/gstreamer/gstreamer-rs", branch = "main" }
+gst-audio = { package = "gstreamer-audio", git = "https://gitlab.freedesktop.org/gstreamer/gstreamer-rs", branch = "main" }
+gst-base = { package = "gstreamer-base", git = "https://gitlab.freedesktop.org/gstreamer/gstreamer-rs", branch = "main", features = ["v1_22"] }
+gst-video = { package = "gstreamer-video", git = "https://gitlab.freedesktop.org/gstreamer/gstreamer-rs", branch = "main" }
+gst-pbutils = { package = "gstreamer-pbutils", git = "https://gitlab.freedesktop.org/gstreamer/gstreamer-rs", branch = "main", features = ["v1_20"] }
+tokio = { version = "1.36.0", default-features = false, features = ["time", "rt-multi-thread", "macros"] }
+futures = "0.3.30"
+quinn = { version = "0.11.5", default-features = false, features = ["ring", "rustls", "runtime-tokio", "log"] }
+quinn-proto ={ version = "0.11.8", default-features = false, features = ["rustls", "log"] }
+rustls = { version = "0.23", default-features = false, features = ["std"] }
+rustls-pemfile = "2"
+rustls-pki-types = "1"
+bytes = "1.5.0"
+thiserror = "2"
+web-transport-quinn = "0.3.3"
+url = "2.5.2"
+once_cell = "1.20.2"
+http = "1.1"
+moq-transport = { git = "https://github.com/englishm/moq-rs.git", rev = "fefb38f788af14146ab44ec8f06aa1931dcaeed5" }
+moq-catalog = { git = "https://github.com/englishm/moq-rs.git", rev = "fefb38f788af14146ab44ec8f06aa1931dcaeed5" }
+moq-native-ietf = { git = "https://github.com/englishm/moq-rs.git", rev = "fefb38f788af14146ab44ec8f06aa1931dcaeed5" }
+serde_json = "1.0"
+anyhow = "1.0"
+ctrlc = "3.4"
+clap = { version = "4", features = ["derive"] }
+
+[profile.release]
+lto = "thin"
+opt-level = 3
+debug = true
+panic = 'unwind'
+
+[profile.dev]
+opt-level = 1
+lto = "off"
+
+[lib]
+name = "gstmoq"
+crate-type = ["cdylib", "rlib"]
+path = "src/lib.rs"
+
+[build-dependencies]
+gst-plugin-version-helper = "0.8.1"
+
+[features]
+static = []
+capi = []
+doc = []
+
+[package.metadata.capi]
+min_version = "0.9.21"
+
+[package.metadata.capi.header]
+enabled = false
+
+[package.metadata.capi.library]
+install_subdir = "gstreamer-1.0"
+versioning = false
+import_library = false
+
+[package.metadata.capi.pkg_config]
+requires_private = "gstreamer-1.0, gstreamer-base-1.0, gobject-2.0, glib-2.0"

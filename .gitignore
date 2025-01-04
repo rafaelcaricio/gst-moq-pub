@@ -1,0 +1,10 @@
+/target
+*~
+*.bk
+*.swp
+.DS_Store
+.vscode
+builddir
+.meson-subproject-wrap-hash.txt
+.aider*
+
