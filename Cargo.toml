@@ -3,6 +3,7 @@ name = "gst-moq"
 authors = ["Rafael Caricio <rafael@caricio.com>"]
 version = "0.1.0"
 edition = "2021"
+license = "MPL-2.0"
 publish = ["crates-io"]
 
 [dependencies]
@@ -30,14 +31,17 @@ moq-catalog = { git = "https://github.com/englishm/moq-rs.git", rev = "fefb38f78
 moq-native-ietf = { git = "https://github.com/englishm/moq-rs.git", rev = "fefb38f788af14146ab44ec8f06aa1931dcaeed5" }
 serde_json = "1.0"
 anyhow = "1.0"
-ctrlc = "3.4"
+
+[dev-dependencies]
 clap = { version = "4", features = ["derive"] }
+ctrlc = "3.4"
+env_logger = "0.11"
 
 [profile.release]
 lto = "thin"
 opt-level = 3
 debug = true
-panic = 'unwind'
+panic = "unwind"
 
 [profile.dev]
 opt-level = 1
@@ -69,3 +73,8 @@ import_library = false
 
 [package.metadata.capi.pkg_config]
 requires_private = "gstreamer-1.0, gstreamer-base-1.0, gobject-2.0, glib-2.0"
+
+[[example]]
+name = "videopub"
+path = "examples/videopub.rs"
+required-features = []

@@ -6,30 +6,22 @@
 //
 // SPDX-License-Identifier: MPL-2.0
 
-use std::collections::HashMap;
-use std::path::PathBuf;
-use std::sync::{Arc, Mutex};
-use std::thread::JoinHandle;
-use tokio::sync::oneshot;
-use url;
-use futures::future::AbortHandle;
+use anyhow::Error;
+use bytes::Bytes;
 use gst::glib;
 use gst::prelude::*;
 use gst::subclass::prelude::*;
-use gst_base::prelude::*;
-use bytes::Bytes;
-use futures::FutureExt;
-use tokio::runtime;
-use std::sync::LazyLock;
-use gst::prelude::*;
-use gst::subclass::prelude::*;
-use gst_base::prelude::*;
-use once_cell::sync::Lazy;
-use moq_transport::serve::{self, ServeError};
+use moq_transport::serve;
 use moq_transport::session::Publisher;
-use anyhow::Error;
-use std::sync::atomic::{AtomicU64, AtomicU32, Ordering};
-
+use once_cell::sync::Lazy;
+use std::collections::HashMap;
+use std::path::PathBuf;
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::LazyLock;
+use std::sync::{Arc, Mutex};
+use tokio::runtime;
+use tokio::task::JoinHandle;
+use url;
 
 static CAT: Lazy<gst::DebugCategory> = Lazy::new(|| {
     gst::DebugCategory::new(
@@ -54,9 +46,6 @@ struct MoqPublisherSinkPadSettings {
 
     // Track priority (0-255)
     priority: u8,
-
-    // Group identifier for correlated tracks
-    group_id: u8,
 }
 
 impl From<gst::Structure> for MoqPublisherSinkPadSettings {
@@ -64,7 +53,6 @@ impl From<gst::Structure> for MoqPublisherSinkPadSettings {
         MoqPublisherSinkPadSettings {
             track_name: s.get::<String>("track-name").unwrap(),
             priority: s.get::<u8>("priority").unwrap(),
-            group_id: s.get::<u8>("group_id").unwrap(),
         }
     }
 }
@@ -74,7 +62,6 @@ impl From<MoqPublisherSinkPadSettings> for gst::Structure {
         gst::Structure::builder("track-settings")
             .field("track-name", obj.track_name)
             .field("priority", obj.priority)
-            .field("group_id", obj.group_id)
             .build()
     }
 }
@@ -123,9 +110,7 @@ impl ObjectImpl for MoqPublisherSinkPad {
         let settings = self.settings.lock().unwrap();
 
         match pspec.name() {
-            "track-settings" => {
-                Into::<gst::Structure>::into(settings.clone()).to_value()
-            }
+            "track-settings" => Into::<gst::Structure>::into(settings.clone()).to_value(),
             _ => unimplemented!(),
         }
     }
@@ -139,33 +124,11 @@ impl ProxyPadImpl for MoqPublisherSinkPad {}
 
 impl GhostPadImpl for MoqPublisherSinkPad {}
 
-impl MoqPublisherSinkPad {
-    fn parent(&self) -> super::MoqPublisherSinkPad {
-        self.obj()
-            .parent()
-            .map(|elem_obj| {
-                elem_obj
-                    .downcast::<super::MoqPublisherSinkPad>()
-                    .expect("Wrong Element type")
-            })
-            .expect("Pad should have a parent at this stage")
-    }
-}
-
 struct State {
-    publisher: Option<Publisher>,
-    tracks_writer: Option<serve::TracksWriter>,
-    connection_task: Option<JoinHandle<()>>,
-}
-
-impl Default for State {
-    fn default() -> Self {
-        Self {
-            publisher: None,
-            tracks_writer: None,
-            connection_task: None,
-        }
-    }
+    broadcast: serve::TracksWriter,
+    catalog: serve::GroupsWriter,
+    connection_task: JoinHandle<()>,
+    announce_task: JoinHandle<()>,
 }
 
 #[derive(Debug, Clone)]
@@ -195,63 +158,56 @@ impl Default for Settings {
 }
 
 struct TrackData {
-    cmafmux: gst::Element,
-    appsink: gst_app::AppSink,
-    track_writer: Option<serve::GroupsWriter>,
+    segment_track: Option<serve::GroupsWriter>,
+    init_track: Option<serve::GroupsWriter>,
     pad: String,
     sequence: AtomicU64,
-    init_segment: Mutex<Option<gst::Buffer>>,
 
-    // Media info for track, set after first caps
+    // Media info for track, set after the caps are fixed
     media_info: Option<MediaInfo>,
 }
 
 #[derive(Clone)]
 struct MediaInfo {
-    mime_type: String,
-    width: Option<u32>,
-    height: Option<u32>,
-    framerate: Option<gst::Fraction>,
-    channels: Option<u32>,
-    sample_rate: Option<u32>,
-    language: Option<String>,
+    codec_mime: String,
+    width: Option<i32>,
+    height: Option<i32>,
+    channels: Option<i32>,
+    sample_rate: Option<i32>,
 }
 
-fn get_mime_type(caps: &gst::Caps) -> String {
+fn get_codec_mime_from_caps(caps: &gst::CapsRef) -> String {
     let mime = gst_pbutils::codec_utils_caps_get_mime_codec(caps);
-    mime.map(|s| s.to_string()).unwrap_or_else(|_| "application/octet-stream".to_string())
+    mime.map(|s| s.to_string())
+        .unwrap_or_else(|_| "application/octet-stream".to_string())
 }
 
 impl MediaInfo {
-    fn new(caps: &gst::Caps) -> Self {
-        let mime_type = get_mime_type(caps);
-        let structure = caps.structure(0).unwrap();
-        let width = structure.get::<u32>("width").ok();
-        let height = structure.get::<u32>("height").ok();
-        let framerate = structure.get::<gst::Fraction>("framerate").ok();
-        let channels = structure.get::<u32>("channels").ok();
-        let sample_rate = structure.get::<u32>("rate").ok();
-        let language = structure.get::<String>("language").ok();
+    fn new(caps: &gst::CapsRef) -> Self {
+        let codec_mime = get_codec_mime_from_caps(caps);
+        let s = caps.structure(0).unwrap();
+        let width = s.get::<i32>("width").ok();
+        let height = s.get::<i32>("height").ok();
+        let channels = s.get::<i32>("channels").ok();
+        let sample_rate = s.get::<i32>("rate").ok();
 
         Self {
-            mime_type,
+            codec_mime,
             width,
             height,
-            framerate,
             channels,
             sample_rate,
-            language,
         }
     }
 }
 
 pub struct MoqPublisher {
     settings: Arc<Mutex<Settings>>,
-    state: Arc<Mutex<State>>,
+    state: Arc<Mutex<Option<State>>>,
 
     // Pad name -> TrackData
     track_data: Mutex<HashMap<String, TrackData>>,
-    
+
     // Counter for generating unique sink pad names
     sink_pad_counter: AtomicU32,
 }
@@ -266,7 +222,7 @@ impl ObjectSubclass for MoqPublisher {
     fn new() -> Self {
         Self {
             settings: Arc::new(Mutex::new(Settings::default())),
-            state: Arc::new(Mutex::new(State::default())),
+            state: Arc::new(Mutex::new(None)),
             track_data: Mutex::new(HashMap::new()),
             sink_pad_counter: AtomicU32::new(0),
         }
@@ -369,16 +325,27 @@ impl ChildProxyImpl for MoqPublisher {
 }
 
 impl ElementImpl for MoqPublisher {
+    fn metadata() -> Option<&'static gst::subclass::ElementMetadata> {
+        static ELEMENT_METADATA: LazyLock<gst::subclass::ElementMetadata> = LazyLock::new(|| {
+            gst::subclass::ElementMetadata::new(
+                "MoQ Publisher Sink",
+                "Source/Network/QUIC/MoQ",
+                "Send media data to a MoQ relay server",
+                "Rafael Caricio <rafael@caricio.com>",
+            )
+        });
+        Some(&*ELEMENT_METADATA)
+    }
+
     fn pad_templates() -> &'static [gst::PadTemplate] {
         static PAD_TEMPLATES: LazyLock<Vec<gst::PadTemplate>> = LazyLock::new(|| {
             // Caps are restricted by the cmafmux element negotiation inside our bin element
-            let caps = gst::Caps::new_any();
             let sink_pad_template = gst::PadTemplate::with_gtype(
                 "sink_%u",
                 gst::PadDirection::Sink,
                 gst::PadPresence::Request,
-                &caps,
-                super::MoqPublisher::static_type(),
+                &gst::Caps::new_any(),
+                super::MoqPublisherSinkPad::static_type(),
             )
             .unwrap();
 
@@ -395,15 +362,21 @@ impl ElementImpl for MoqPublisher {
         _caps: Option<&gst::Caps>,
     ) -> Option<gst::Pad> {
         let element = self.obj();
-        
+
         // Only allow pad requests in NULL/READY state
         if element.current_state() > gst::State::Ready {
-            gst::error!(CAT, obj = element, "Cannot request pad in non-NULL/READY state");
+            gst::error!(
+                CAT,
+                obj = element,
+                "Cannot request pad in non-NULL/READY state"
+            );
             return None;
         }
 
+        gst::info!(CAT, obj = element, "Requesting new sink pad");
+
         let settings = self.settings.lock().unwrap();
-        
+
         // Generate unique pad name
         let pad_num = self.sink_pad_counter.fetch_add(1, Ordering::SeqCst);
         let pad_name = format!("sink_{}", pad_num);
@@ -415,9 +388,9 @@ impl ElementImpl for MoqPublisher {
 
         // Create internal elements
         let cmafmux = gst::ElementFactory::make("cmafmux")
-            .property("fragment-duration", settings.fragment_duration.mseconds())
-            .property("write-mehd", true)
+            .property("fragment-duration", settings.fragment_duration)
             .property_from_str("header-update-mode", "update")
+            .property("write-mehd", true)
             .build()
             .unwrap();
 
@@ -427,7 +400,7 @@ impl ElementImpl for MoqPublisher {
             .sync(true)
             .callbacks({
                 let this = self.downgrade();
-                
+
                 gst_app::AppSinkCallbacks::builder()
                     .new_sample(move |appsink| {
                         let this = match this.upgrade() {
@@ -437,15 +410,22 @@ impl ElementImpl for MoqPublisher {
 
                         let sample = appsink.pull_sample().map_err(|_| gst::FlowError::Eos)?;
                         let buffer_list = sample.buffer_list_owned().expect("no buffer list");
-                        
+
                         let mut track_data = this.track_data.lock().unwrap();
                         let track = track_data.get_mut(&pad_name).unwrap();
-                        
+
+                        gst::debug!(
+                            CAT,
+                            obj = this.obj(),
+                            "Received buffer list with {} buffers",
+                            buffer_list.len()
+                        );
+
                         if let Err(err) = this.handle_cmaf_data(track, buffer_list) {
                             gst::error!(CAT, "Failed to handle CMAF data: {}", err);
                             return Err(gst::FlowError::Error);
                         }
-                        
+
                         Ok(gst::FlowSuccess::Ok)
                     })
                     .build()
@@ -460,25 +440,89 @@ impl ElementImpl for MoqPublisher {
         let muxer_sink = cmafmux.static_pad("sink").unwrap();
         sink_pad.set_target(Some(&muxer_sink)).unwrap();
 
+        // Add probe for caps events
+        sink_pad.add_probe(gst::PadProbeType::EVENT_BOTH, {
+            let this = self.downgrade();
+            move |pad, info| {
+                let this = match this.upgrade() {
+                    Some(this) => this,
+                    None => return gst::PadProbeReturn::Remove,
+                };
+
+                if let Some(gst::PadProbeData::Event(ref event)) = info.data {
+                    if let gst::EventView::Caps(caps_evt) = event.view() {
+                        let caps = caps_evt.caps();
+                        gst::debug!(
+                            CAT,
+                            obj = this.obj(),
+                            "Received caps event on pad {}: {:?}",
+                            pad.name(),
+                            caps
+                        );
+
+                        // Create MediaInfo from the caps
+                        let media_info = MediaInfo::new(caps);
+
+                        // Store the media info in track data
+                        let mut track_data = this.track_data.lock().unwrap();
+                        gst::debug!(
+                            CAT,
+                            obj = this.obj(),
+                            "Updating media info for track {}",
+                            pad.name()
+                        );
+                        if let Some(track) = track_data.get_mut(&pad.name().to_string()) {
+                            track.media_info = Some(media_info);
+                            gst::debug!(
+                                CAT,
+                                obj = this.obj(),
+                                "Updated media info for track {}",
+                                pad.name()
+                            );
+
+                            // Check if all tracks have media info and create catalog if ready
+                            if track_data.values().all(|t| t.media_info.is_some()) {
+                                gst::debug!(
+                                    CAT,
+                                    obj = this.obj(),
+                                    "All tracks have media info, creating catalog"
+                                );
+                                drop(track_data);
+                                if let Err(e) = this.create_catalog() {
+                                    gst::error!(CAT, obj = pad, "Failed to create catalog: {}", e);
+                                }
+                            } else {
+                                gst::debug!(
+                                    CAT,
+                                    obj = this.obj(),
+                                    "Not all tracks have media info yet"
+                                );
+                            }
+                        }
+                    }
+                }
+
+                gst::PadProbeReturn::Ok
+            }
+        });
+
         // Add pad to element
         element.add_pad(&sink_pad).unwrap();
         element.child_added(sink_pad.upcast_ref::<gst::Object>(), &sink_pad.name());
 
         // Store track data
         let track_data = TrackData {
-            cmafmux,
-            appsink,
-            track_writer: None, // Will be set up in READY->PAUSED
+            segment_track: None, // Will be set up in READY->PAUSED
+            init_track: None,   // Will be set up in READY->PAUSED
             pad: sink_pad.name().to_string(),
             sequence: AtomicU64::new(1), // Start at 1 since 0 is reserved for init segment
-            init_segment: Mutex::new(None),
             media_info: None,
         };
 
-        self.track_data.lock().unwrap().insert(
-            sink_pad.name().to_string(),
-            track_data
-        );
+        self.track_data
+            .lock()
+            .unwrap()
+            .insert(sink_pad.name().to_string(), track_data);
 
         Some(sink_pad.upcast())
     }
@@ -489,32 +533,24 @@ impl ElementImpl for MoqPublisher {
     ) -> Result<gst::StateChangeSuccess, gst::StateChangeError> {
         match transition {
             gst::StateChange::ReadyToPaused => {
-                // Setup WebTransport connection
+                // Setup connection and publisher in one go
                 if let Err(e) = self.setup_connection() {
                     gst::error!(CAT, obj = self.obj(), "Failed to setup connection: {:?}", e);
                     return Err(e);
                 }
-                
-                // Setup MoQ publisher
-                if let Err(e) = self.setup_publisher() {
-                    gst::error!(CAT, obj = self.obj(), "Failed to setup publisher: {:?}", e);
-                    return Err(e);
-                }
-            }
-            
-            gst::StateChange::PausedToPlaying => {
-                // Announce tracks
+
+                // Announce tracks after connection setup
                 if let Err(e) = self.announce_tracks() {
                     gst::error!(CAT, obj = self.obj(), "Failed to announce tracks: {:?}", e);
                     return Err(e);
                 }
             }
-            
+
             gst::StateChange::PausedToReady => {
                 // Cleanup publisher
                 self.cleanup_publisher();
             }
-            
+
             _ => (),
         }
 
@@ -523,188 +559,252 @@ impl ElementImpl for MoqPublisher {
     }
 }
 
-// ## Internal Architecture
-// For each request sink pad, create:
-// 1. A cmafmux element for CMAF packaging
-// 2. An appsink element to receive packaged media
-// 3. A MoQ track publisher instance using moq-transport
-//
-// ## CMAF Integration Requirements
-//
-// The cmafmux element outputs buffer lists with this structure:
-//
-// Media Header (optional, has DISCONT|HEADER flags)
-//    - Contains ftyp/moov boxes
-//    - Only present at start or during header updates
-//    - Must be handled separately as initialization data
-//
-// Segment Header (has HEADER flag)
-//    - First buffer in each media segment
-//    - Contains timing information in buffer metadata
-//
-// Media Data Buffers
-//    - Remaining buffers in list
-//    - Contains actual media payload
-//
-// ## MoQ Transport Integration
-//
-// Use the moq-transport crate's API:
-//
-// Track Setup: ```rust // Create tracks container let (writer, _, reader) = serve::Tracks::new(namespace).produce();
-// // Start announcing
-// publisher.announce(reader).await?;
-//
-// // Create track
-// let track = writer.create(&track_name)?;
-// let track_writer = track.groups()?;
-// ```
-//
-// Group Publishing: ```rust // Create group for segment let group = track_writer.create(serve::Group {     group_id: sequence_number,     priority: track_priority, })?;
-// // Write data
-// group.write(buffer_data)?;
-// ```
-//
-// ## Key Implementation Requirements
-//
-// Handle initialization segments (ftyp/moov):
-//    - Detect using DISCONT|HEADER flags
-//    - Send as separate MoQ group
-//    - Cache for header updates
-//
-// Handle media segments:
-//    - Create new MoQ group for each CMAF segment
-//    - Use sequence numbers from buffer timestamps
-//    - Track priorities per sink pad
-//
-// Buffer Processing:
-//    - Process all cmafmux buffer list components
-//    - Extract timing info from segment headers
-//    - Handle header updates correctly
-//
-// Error Handling:
-//    - Handle MoQ connection failures
-//    - Handle track announcement errors
-//    - Clean up resources properly
 impl MoqPublisher {
     fn setup_connection(&self) -> Result<(), gst::StateChangeError> {
         let settings = self.settings.lock().unwrap();
-        let url = url::Url::parse(&settings.url)
+        let url = url::Url::parse(&settings.url).map_err(|e| {
+            gst::error!(CAT, obj = self.obj(), "Invalid URL {}: {}", settings.url, e);
+            gst::StateChangeError
+        })?;
+        let namespace = settings.namespace.clone();
+        let cert_path = settings.certificate_file.clone();
+        drop(settings);
+
+        // Setup connection synchronously in the runtime
+        let (broadcast, catalog, connection_task, announce_task) = RUNTIME.block_on(async {
+            let mut tls = moq_native_ietf::tls::Args::default();
+            if let Some(path) = cert_path {
+                tls.root = vec![path];
+            }
+            tls.disable_verify = true;
+
+            let quic = moq_native_ietf::quic::Endpoint::new(moq_native_ietf::quic::Config {
+                bind: "[::]:0".parse().unwrap(),
+                tls: tls.load().map_err(|e| {
+                    gst::error!(CAT, obj = self.obj(), "Failed to load TLS config: {}", e);
+                    gst::StateChangeError
+                })?,
+            })
             .map_err(|e| {
-                gst::error!(CAT, obj = self.obj(), "Invalid URL {}: {}", settings.url, e);
+                gst::error!(
+                    CAT,
+                    obj = self.obj(),
+                    "Failed to create QUIC endpoint: {}",
+                    e
+                );
                 gst::StateChangeError
             })?;
 
-        let state = self.state.clone();
-        let cert_path = settings.certificate_file.clone();
+            let session = quic.client.connect(&url).await.map_err(|e| {
+                gst::error!(CAT, obj = self.obj(), "Failed to connect: {}", e);
+                gst::StateChangeError
+            })?;
 
-        // Spawn connection task
-        let handle = std::thread::spawn(move || {
-            RUNTIME.block_on(async move {
-                let mut tls = moq_native_ietf::tls::Args::default();
-                if let Some(path) = cert_path {
-                    tls.root = vec![path];
+            let (session, mut publisher) = Publisher::connect(session).await.map_err(|e| {
+                gst::error!(CAT, obj = self.obj(), "Failed to create publisher: {}", e);
+                gst::StateChangeError
+            })?;
+
+            // Create tracks container
+            let (mut broadcast, _, reader) = serve::Tracks::new(namespace).produce();
+
+            // Create catalog track
+            let catalog = broadcast
+                .create(".catalog")
+                .ok_or_else(|| gst::StateChangeError)?
+                .groups()
+                .map_err(|_| gst::StateChangeError)?;
+
+            // Create connection task
+            let connection_task = tokio::spawn({
+                let el_weak = self.obj().downgrade();
+                async move {
+                    let element = el_weak.upgrade().unwrap();
+                    gst::debug!(CAT, obj = element, "Starting session");
+                    if let Err(e) = session.run().await {
+                        gst::error!(CAT, obj = element, "Session error: {}", e);
+                        element.send_event(gst::event::Eos::new());
+                    }
+                    gst::debug!(CAT, obj = element, "Session done!");
                 }
-                tls.disable_verify = true;
-
-                let quic = moq_native_ietf::quic::Endpoint::new(moq_native_ietf::quic::Config {
-                    bind: "[::]:0".parse().unwrap(),
-                    tls: tls.load().unwrap(),
-                }).unwrap();
-
-                let session = quic.client.connect(&url).await.unwrap();
-                let (session, publisher) = moq_transport::session::Publisher::connect(session).await.unwrap();
-
-                let mut state = state.lock().unwrap();
-                state.publisher = Some(publisher);
-
-                session.run().await.unwrap();
             });
-        });
 
-        self.state.lock().unwrap().connection_task = Some(handle);
+            // Create announce task
+            let announce_task = tokio::spawn({
+                let el_weak = self.obj().downgrade();
+                async move {
+                    let element = el_weak.upgrade().unwrap();
+                    gst::debug!(CAT, obj = element, "Announcing tracks");
+                    if let Err(e) = publisher.announce(reader).await {
+                        gst::error!(CAT, obj = element, "Publisher announce error: {}", e);
+                        element.send_event(gst::event::Eos::new());
+                    }
+                    gst::debug!(CAT, obj = element, "Announce done!");
+                }
+            });
 
-        Ok(())
-    }
-
-    fn setup_publisher(&self) -> Result<(), gst::StateChangeError> {
-        let settings = self.settings.lock().unwrap();
-        let namespace = settings.namespace.clone();
-        drop(settings);
-
-        // Wait for publisher to be available
-        let mut retries = 0;
-        while self.state.lock().unwrap().publisher.is_none() {
-            if retries > 50 {
-                gst::error!(CAT, obj = self.obj(), "Timeout waiting for publisher connection");
-                return Err(gst::StateChangeError);
-            }
-            std::thread::sleep(std::time::Duration::from_millis(100));
-            retries += 1;
-        }
-
-        // Create tracks container
-        let (writer, _, reader) = serve::Tracks::new(namespace).produce();
-
-        let mut state = self.state.lock().unwrap();
-        let publisher = state.publisher.as_mut().unwrap();
-
-        // Start announcing tracks
-        let announce_future = publisher.announce(reader);
-        RUNTIME.block_on(announce_future).map_err(|e| {
-            gst::error!(CAT, obj = self.obj(), "Failed to announce tracks: {}", e);
-            gst::StateChangeError
+            Ok::<_, gst::StateChangeError>((broadcast, catalog, connection_task, announce_task))
         })?;
 
-        state.tracks_writer = Some(writer);
+        gst::info!(CAT, obj = self.obj(), "Connected to MoQ relay at {}", url);
+
+        // Store new state
+        *self.state.lock().unwrap() = Some(State {
+            broadcast,
+            catalog,
+            connection_task,
+            announce_task,
+        });
 
         Ok(())
     }
 
     fn announce_tracks(&self) -> Result<(), gst::StateChangeError> {
-        let mut state = self.state.lock().unwrap();
-        let tracks_writer = state.tracks_writer.as_mut().ok_or_else(|| {
-            gst::error!(CAT, obj = self.obj(), "No tracks writer available");
+        let mut state_guard = self.state.lock().unwrap();
+        let state = state_guard.as_mut().ok_or_else(|| {
+            gst::error!(CAT, obj = self.obj(), "Not in ready state");
             gst::StateChangeError
         })?;
 
         let mut track_data = self.track_data.lock().unwrap();
 
-        // Setup track writers for each pad
-        for (_, track) in track_data.iter_mut() {
-            let track_writer = tracks_writer.create(&track.pad).ok_or_else(|| {
-                gst::error!(CAT, obj = self.obj(), "Failed to create track writer");
+        for (pad_name, track) in track_data.iter_mut() {
+            // Create per-track init segment track
+            let init_track = state
+                .broadcast
+                .create(&format!("{}_init.mp4", pad_name))
+                .ok_or_else(|| {
+                    gst::error!(CAT, obj = self.obj(), "Failed to create init track");
+                    gst::StateChangeError
+                })?
+                .groups()
+                .map_err(|_| gst::StateChangeError)?;
+
+            track.init_track = Some(init_track);
+
+            // Create media track
+            let track_writer = state
+                .broadcast
+                .create(&format!("{}.m4s", pad_name))
+                .ok_or_else(|| {
+                    gst::error!(CAT, obj = self.obj(), "Failed to create track writer");
+                    gst::StateChangeError
+                })?;
+
+            track.segment_track = Some(track_writer.groups().map_err(|_| {
+                gst::error!(CAT, obj = self.obj(), "Failed to create segment track");
+                gst::StateChangeError
+            })?);
+        }
+
+        Ok(())
+    }
+
+    fn create_catalog(&self) -> Result<(), Error> {
+        let mut state_guard = self.state.lock().unwrap();
+        let state = state_guard
+            .as_mut()
+            .ok_or_else(|| anyhow::anyhow!("Not in ready state"))?;
+
+        let mut tracks = Vec::new();
+        let mut track_data = self.track_data.lock().unwrap();
+
+        for (pad_name, track) in track_data.iter_mut() {
+            let media_info = track
+                .media_info
+                .as_ref()
+                .ok_or_else(|| anyhow::anyhow!("Missing media info for track {}", pad_name))?;
+
+            let mut selection_params = moq_catalog::SelectionParam::default();
+
+            // Use get_mime_type for codec string
+            selection_params.codec = Some(media_info.codec_mime.clone());
+
+            // Set video-specific parameters
+            if let (Some(width), Some(height)) = (media_info.width, media_info.height) {
+                selection_params.width = Some(width as u32);
+                selection_params.height = Some(height as u32);
+            }
+
+            // Set audio-specific parameters
+            if let Some(channels) = media_info.channels {
+                selection_params.channel_config = Some(channels.to_string());
+            }
+            if let Some(sample_rate) = media_info.sample_rate {
+                selection_params.samplerate = Some(sample_rate as u32);
+            }
+
+            let catalog_track = moq_catalog::Track {
+                init_track: Some(format!("{}_init.mp4", pad_name)), // Track-specific init reference
+                name: format!("{}.m4s", pad_name),
+                namespace: Some(state.broadcast.namespace.clone()),
+                packaging: Some(moq_catalog::TrackPackaging::Cmaf),
+                render_group: Some(1),
+                selection_params,
+                ..Default::default()
+            };
+
+            tracks.push(catalog_track);
+        }
+
+        let catalog = moq_catalog::Root {
+            version: 1,
+            streaming_format: 1,
+            streaming_format_version: "0.2".to_string(),
+            streaming_delta_updates: true,
+            common_track_fields: moq_catalog::CommonTrackFields::from_tracks(&mut tracks),
+            tracks,
+        };
+
+        let catalog_str = serde_json::to_string_pretty(&catalog)?;
+        gst::info!(CAT, obj = self.obj(), "MoQ catalog: {}", catalog_str);
+
+        // Write catalog to track
+        state
+            .catalog
+            .append(0)
+            .map_err(|e| {
+                gst::error!(CAT, obj = self.obj(), "Failed to append catalog: {}", e);
+                gst::StateChangeError
+            })?
+            .write(catalog_str.into())
+            .map_err(|e| {
+                gst::error!(CAT, obj = self.obj(), "Failed to write catalog: {}", e);
                 gst::StateChangeError
             })?;
 
-            track.track_writer = Some(track_writer.groups().unwrap());
-        }
+        gst::debug!(CAT, obj = self.obj(), "Published catalog");
 
         Ok(())
     }
 
     fn cleanup_publisher(&self) {
         let mut state = self.state.lock().unwrap();
-        
+
         // Clear track writers
         let mut track_data = self.track_data.lock().unwrap();
         for (_, track) in track_data.iter_mut() {
-            track.track_writer = None;
+            track.segment_track = None;
         }
 
-        // Clear publisher state
-        state.publisher = None;
-        state.tracks_writer = None;
+        // Take and clean up state if it exists
+        if let Some(state) = state.take() {
+            // Abort both tasks
+            state.connection_task.abort();
+            state.announce_task.abort();
 
-        // Abort connection task if running
-        if let Some(handle) = state.connection_task.take() {
-            handle.join().ok();
+            // Wait for both tasks
+            let _ = RUNTIME.block_on(async {
+                let _ = state.connection_task.await;
+                let _ = state.announce_task.await;
+            });
         }
     }
 
     fn handle_cmaf_data(
         &self,
-        track: &mut TrackData, 
-        mut buffer_list: gst::BufferList
+        track: &mut TrackData,
+        mut buffer_list: gst::BufferList,
     ) -> Result<(), Error> {
         assert!(!buffer_list.is_empty());
 
@@ -714,27 +814,30 @@ impl MoqPublisher {
         assert!(!first.flags().contains(gst::BufferFlags::DELTA_UNIT));
 
         // Handle initialization segment
-        if first.flags().contains(gst::BufferFlags::DISCONT | gst::BufferFlags::HEADER) {
-            let mut init_guard = track.init_segment.lock().unwrap();
-            *init_guard = Some(first.copy());
-            
-            // Create high priority group for init segment
-            let mut group = track.track_writer.as_mut()
-                .expect("track writer not initialized")
-                .create(serve::Group {
-                    group_id: 0,
-                    priority: 0, // Highest priority
-                })?;
+        if first
+            .flags()
+            .contains(gst::BufferFlags::DISCONT | gst::BufferFlags::HEADER)
+        {
+            // Write to track's init track
+            let init_track = track.init_track.as_mut().ok_or_else(|| {
+                anyhow::anyhow!("Init track not initialized for pad {}", track.pad)
+            })?;
 
+            let mut group = init_track.append(0)?;
             let map = first.map_readable().unwrap();
             group.write(Bytes::copy_from_slice(&map))?;
             drop(map);
 
-            drop(init_guard);
+            gst::debug!(
+                CAT,
+                obj = self.obj(),
+                "Wrote init segment for track {}",
+                track.pad
+            );
 
-            // Remove first buffer since it is our init segment
+            // Remove init segment from buffer list and continue with media data
             buffer_list.make_mut().remove(0..1);
-            
+
             if buffer_list.is_empty() {
                 return Ok(());
             }
@@ -746,13 +849,20 @@ impl MoqPublisher {
             return Err(anyhow::anyhow!("Missing segment header"));
         }
 
-        let pad = self.obj().static_pad(&track.pad).unwrap().downcast::<super::MoqPublisherSinkPad>().unwrap();
+        let pad = self
+            .obj()
+            .static_pad(&track.pad)
+            .unwrap()
+            .downcast::<super::MoqPublisherSinkPad>()
+            .unwrap();
 
         let segment_sequence = track.sequence.fetch_add(1, Ordering::SeqCst);
         let priority = pad.imp().settings.lock().unwrap().priority;
 
         // Create MoQ group for segment
-        let mut group = track.track_writer.as_mut()
+        let mut group = track
+            .segment_track
+            .as_mut()
             .expect("track writer not initialized")
             .create(serve::Group {
                 group_id: segment_sequence,
@@ -761,9 +871,17 @@ impl MoqPublisher {
 
         // Write all buffers
         for buffer in buffer_list.iter() {
-            let map = buffer.map_readable().unwrap(); 
+            let map = buffer.map_readable().unwrap();
             group.write(Bytes::copy_from_slice(&map))?;
         }
+
+        gst::debug!(
+            CAT,
+            obj = self.obj(),
+            "Published group {} for pad {}",
+            segment_sequence,
+            track.pad
+        );
 
         Ok(())
     }

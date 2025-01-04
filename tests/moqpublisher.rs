@@ -6,6 +6,7 @@ fn init() {
 
     INIT.call_once(|| {
         gst::init().unwrap();
+        gstmoq::plugin_register_static().unwrap();
     });
 }
 
@@ -58,7 +59,6 @@ fn test_element_basic_usage() {
     let s = gst::Structure::builder("video1-rendition")
         .field("track-name", "VIDEO")
         .field("priority", 127u8)
-        .field("group-id", 1u8)
         .build();
     video_pad.set_property("track-settings", &s);
 
