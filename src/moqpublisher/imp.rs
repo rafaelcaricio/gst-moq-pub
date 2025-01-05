@@ -159,7 +159,9 @@ impl Default for Settings {
 
 struct TrackData {
     segment_track: Option<serve::GroupsWriter>,
+    segment_track_name: Option<String>,
     init_track: Option<serve::GroupsWriter>,
+    init_track_name: Option<String>,
     pad: String,
     sequence: AtomicU64,
 
@@ -513,7 +515,9 @@ impl ElementImpl for MoqPublisher {
         // Store track data
         let track_data = TrackData {
             segment_track: None, // Will be set up in READY->PAUSED
+            segment_track_name: None,
             init_track: None,   // Will be set up in READY->PAUSED
+            init_track_name: None,
             pad: sink_pad.name().to_string(),
             sequence: AtomicU64::new(1), // Start at 1 since 0 is reserved for init segment
             media_info: None,
@@ -669,10 +673,21 @@ impl MoqPublisher {
         let mut track_data = self.track_data.lock().unwrap();
 
         for (pad_name, track) in track_data.iter_mut() {
+            let pad = self
+                .obj()
+                .static_pad(pad_name)
+                .unwrap()
+                .downcast::<super::MoqPublisherSinkPad>()
+                .unwrap();
+
+            let track_name = pad.imp().settings.lock().unwrap().track_name.clone();
+            let init_track_name = format!("{}_init.mp4", track_name);
+            let segment_track_name = format!("{}.m4s", track_name);
+
             // Create per-track init segment track
             let init_track = state
                 .broadcast
-                .create(&format!("{}_init.mp4", pad_name))
+                .create(&init_track_name)
                 .ok_or_else(|| {
                     gst::error!(CAT, obj = self.obj(), "Failed to create init track");
                     gst::StateChangeError
@@ -685,11 +700,14 @@ impl MoqPublisher {
             // Create media track
             let track_writer = state
                 .broadcast
-                .create(&format!("{}.m4s", pad_name))
+                .create(&segment_track_name)
                 .ok_or_else(|| {
                     gst::error!(CAT, obj = self.obj(), "Failed to create track writer");
                     gst::StateChangeError
                 })?;
+
+            track.init_track_name = Some(init_track_name);
+            track.segment_track_name = Some(segment_track_name);
 
             track.segment_track = Some(track_writer.groups().map_err(|_| {
                 gst::error!(CAT, obj = self.obj(), "Failed to create segment track");
@@ -713,7 +731,7 @@ impl MoqPublisher {
             let media_info = track
                 .media_info
                 .as_ref()
-                .ok_or_else(|| anyhow::anyhow!("Missing media info for track {}", pad_name))?;
+                .ok_or_else(|| anyhow::anyhow!("Missing media info for track on pad {}", pad_name))?;
 
             let mut selection_params = moq_catalog::SelectionParam::default();
 
@@ -735,8 +753,8 @@ impl MoqPublisher {
             }
 
             let catalog_track = moq_catalog::Track {
-                init_track: Some(format!("{}_init.mp4", pad_name)), // Track-specific init reference
-                name: format!("{}.m4s", pad_name),
+                init_track: track.init_track_name.clone(),
+                name: track.segment_track_name.clone().unwrap(),
                 namespace: Some(state.broadcast.namespace.clone()),
                 packaging: Some(moq_catalog::TrackPackaging::Cmaf),
                 render_group: Some(1),
