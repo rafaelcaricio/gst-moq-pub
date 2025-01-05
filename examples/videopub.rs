@@ -52,7 +52,7 @@ fn setup_audio_elements(
 
     let audio_pad = moqpub.request_pad_simple("sink_%u").unwrap();
     let audio_settings = gst::Structure::builder("audio1-rendition")
-        .field("track-name", "AUDIO")
+        .field("track-name", "audio_1")
         .field("priority", 100u8)
         .build();
     audio_pad.set_property("track-settings", &audio_settings);
@@ -116,7 +116,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Setup moqpublisher pad
     let video_pad = moqpub.request_pad_simple("sink_%u").unwrap();
     let s = gst::Structure::builder("video1-rendition")
-        .field("track-name", "VIDEO")
+        .field("track-name", "video_1")
         .field("priority", 127u8)
         .build();
     video_pad.set_property("track-settings", &s);

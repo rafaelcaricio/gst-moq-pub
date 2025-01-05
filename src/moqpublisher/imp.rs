@@ -42,17 +42,17 @@ static RUNTIME: LazyLock<runtime::Runtime> = LazyLock::new(|| {
 #[derive(Default, Clone)]
 struct MoqPublisherSinkPadSettings {
     // MoQ track name for this pad
-    track_name: String,
+    track_name: Option<String>,
 
     // Track priority (0-255)
-    priority: u8,
+    priority: Option<u8>,
 }
 
 impl From<gst::Structure> for MoqPublisherSinkPadSettings {
     fn from(s: gst::Structure) -> Self {
         MoqPublisherSinkPadSettings {
-            track_name: s.get::<String>("track-name").unwrap(),
-            priority: s.get::<u8>("priority").unwrap(),
+            track_name: s.get_optional::<String>("track-name").unwrap(),
+            priority: s.get_optional::<u8>("priority").unwrap(),
         }
     }
 }
@@ -60,8 +60,8 @@ impl From<gst::Structure> for MoqPublisherSinkPadSettings {
 impl From<MoqPublisherSinkPadSettings> for gst::Structure {
     fn from(obj: MoqPublisherSinkPadSettings) -> Self {
         gst::Structure::builder("track-settings")
-            .field("track-name", obj.track_name)
-            .field("priority", obj.priority)
+            .field_if_some("track-name", obj.track_name)
+            .field_if_some("priority", obj.priority)
             .build()
     }
 }
@@ -680,7 +680,7 @@ impl MoqPublisher {
                 .downcast::<super::MoqPublisherSinkPad>()
                 .unwrap();
 
-            let track_name = pad.imp().settings.lock().unwrap().track_name.clone();
+            let track_name = pad.imp().settings.lock().unwrap().track_name.clone().unwrap_or_else(|| pad_name.clone());
             let init_track_name = format!("{}_init.mp4", track_name);
             let segment_track_name = format!("{}.m4s", track_name);
 
@@ -884,7 +884,7 @@ impl MoqPublisher {
             .expect("track writer not initialized")
             .create(serve::Group {
                 group_id: segment_sequence,
-                priority,
+                priority: priority.unwrap_or(127),
             })?;
 
         // Write all buffers
