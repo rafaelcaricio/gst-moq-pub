@@ -131,6 +131,12 @@ struct State {
     announce_task: JoinHandle<()>,
 }
 
+static DEFAULT_URL: &str = "";
+static DEFAULT_CERTIFICATE_FILE: Option<PathBuf> = None;
+static DEFAULT_FRAGMENT_DURATION: u64 = 2000;
+static DEFAULT_CHUNK_DURATION: u64 = i64::MAX as u64;
+static DEFAULT_NAMESPACE: &str = "default";
+
 #[derive(Debug, Clone)]
 struct Settings {
     // MoQ relay URL to connect to using WebTransport
@@ -139,8 +145,11 @@ struct Settings {
     // Path to client certificate file for WebTransport
     certificate_file: Option<PathBuf>,
 
-    // Makes sure all cmafmux elements have the same duration
+    // Makes sure all cmafmux GoP's duration are the same
     fragment_duration: u64,
+
+    // Duration of each chunk
+    chunk_duration: u64,
 
     // MoQ namespace for tracks
     namespace: String,
@@ -149,10 +158,11 @@ struct Settings {
 impl Default for Settings {
     fn default() -> Self {
         Self {
-            url: String::new(),
-            certificate_file: None,
-            fragment_duration: 2000,
-            namespace: String::from("default"),
+            url: DEFAULT_URL.to_string(),
+            certificate_file: DEFAULT_CERTIFICATE_FILE.clone(),
+            fragment_duration: DEFAULT_FRAGMENT_DURATION,
+            chunk_duration: DEFAULT_CHUNK_DURATION,
+            namespace: DEFAULT_NAMESPACE.to_string(),
         }
     }
 }
@@ -250,7 +260,12 @@ impl ObjectImpl for MoqPublisher {
                 glib::ParamSpecUInt64::builder("fragment-duration")
                     .nick("Fragment Duration")
                     .blurb("CMAF fragment duration in milliseconds")
-                    .default_value(2000)
+                    .default_value(DEFAULT_FRAGMENT_DURATION)
+                    .build(),
+                glib::ParamSpecUInt64::builder("chunk-duration")
+                    .nick("Chunk Duration")
+                    .blurb("Duration of each chunk in milliseconds")
+                    .default_value(DEFAULT_CHUNK_DURATION)
                     .build(),
                 glib::ParamSpecString::builder("namespace")
                     .nick("Namespace")
@@ -278,6 +293,9 @@ impl ObjectImpl for MoqPublisher {
             "fragment-duration" => {
                 settings.fragment_duration = value.get::<u64>().unwrap();
             }
+            "chunk-duration" => {
+                settings.chunk_duration = value.get::<u64>().unwrap();
+            }
             "namespace" => {
                 settings.namespace = value.get::<String>().unwrap();
             }
@@ -295,6 +313,7 @@ impl ObjectImpl for MoqPublisher {
                 .map(|p| p.to_str().unwrap().to_string())
                 .to_value(),
             "fragment-duration" => settings.fragment_duration.to_value(),
+            "chunk-duration" => settings.chunk_duration.to_value(),
             "namespace" => settings.namespace.to_value(),
             _ => unimplemented!(),
         }
@@ -391,6 +410,7 @@ impl ElementImpl for MoqPublisher {
         // Create internal elements
         let cmafmux = gst::ElementFactory::make("cmafmux")
             .property("fragment-duration", settings.fragment_duration)
+            .property("chunk-duration", settings.chunk_duration)
             .property_from_str("header-update-mode", "update")
             .property("write-mehd", true)
             .build()
@@ -827,9 +847,6 @@ impl MoqPublisher {
         assert!(!buffer_list.is_empty());
 
         let mut first = buffer_list.get(0).unwrap();
-
-        // Each list contains a full segment, i.e. does not start with a DELTA_UNIT
-        assert!(!first.flags().contains(gst::BufferFlags::DELTA_UNIT));
 
         // Handle initialization segment
         if first

@@ -80,6 +80,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .property("url", args.url)
         .property("namespace", args.namespace)
         .property("fragment-duration", args.fragment_duration.mseconds())
+        .property("chunk-duration", 40.mseconds()) // 25fps thus 40ms per frame
         .build()?;
 
     // Add certificate file if specified
@@ -94,7 +95,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let videoenc = gst::ElementFactory::make("x264enc")
         .property("bframes", 0u32)
-        .property("key-int-max", i32::MAX as u32)
+        .property("key-int-max", 50u32) // We want keyframes every 2 seconds, as we use chunk-duration, the fragment-duration (request IDR frames) is not used
         .property_from_str("tune", "zerolatency")
         .build()?;
 
@@ -103,6 +104,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             "caps",
             gst::Caps::builder("video/x-h264")
                 .field("profile", "main")
+                .field("framerate", &gst::Fraction::new(25, 1))
                 .build(),
         )
         .build()?;
