@@ -11,6 +11,7 @@ use bytes::Bytes;
 use gst::glib;
 use gst::prelude::*;
 use gst::subclass::prelude::*;
+use moq_transport::coding::Tuple;
 use moq_transport::serve;
 use moq_transport::session::Publisher;
 use once_cell::sync::Lazy;
@@ -126,7 +127,7 @@ impl GhostPadImpl for MoqPublisherSinkPad {}
 
 struct State {
     broadcast: serve::TracksWriter,
-    catalog: serve::GroupsWriter,
+    catalog: serve::SubgroupsWriter,
     connection_task: JoinHandle<()>,
     announce_task: JoinHandle<()>,
 }
@@ -168,9 +169,9 @@ impl Default for Settings {
 }
 
 struct TrackData {
-    segment_track: Option<serve::GroupsWriter>,
     segment_track_name: Option<String>,
-    init_track: Option<serve::GroupsWriter>,
+    segment_track: Option<serve::SubgroupsWriter>,
+    init_track: Option<serve::SubgroupsWriter>,
     init_track_name: Option<String>,
     pad: String,
     sequence: AtomicU64,
@@ -536,7 +537,7 @@ impl ElementImpl for MoqPublisher {
         let track_data = TrackData {
             segment_track: None, // Will be set up in READY->PAUSED
             segment_track_name: None,
-            init_track: None,   // Will be set up in READY->PAUSED
+            init_track: None, // Will be set up in READY->PAUSED
             init_track_name: None,
             pad: sink_pad.name().to_string(),
             sequence: AtomicU64::new(1), // Start at 1 since 0 is reserved for init segment
@@ -590,7 +591,7 @@ impl MoqPublisher {
             gst::error!(CAT, obj = self.obj(), "Invalid URL {}: {}", settings.url, e);
             gst::StateChangeError
         })?;
-        let namespace = settings.namespace.clone();
+        let namespace = Tuple::from_utf8_path(&settings.namespace.clone());
         let cert_path = settings.certificate_file.clone();
         drop(settings);
 
@@ -700,7 +701,14 @@ impl MoqPublisher {
                 .downcast::<super::MoqPublisherSinkPad>()
                 .unwrap();
 
-            let track_name = pad.imp().settings.lock().unwrap().track_name.clone().unwrap_or_else(|| pad_name.clone());
+            let track_name = pad
+                .imp()
+                .settings
+                .lock()
+                .unwrap()
+                .track_name
+                .clone()
+                .unwrap_or_else(|| pad_name.clone());
             let init_track_name = format!("{}_init.mp4", track_name);
             let segment_track_name = format!("{}.m4s", track_name);
 
@@ -718,13 +726,10 @@ impl MoqPublisher {
             track.init_track = Some(init_track);
 
             // Create media track
-            let track_writer = state
-                .broadcast
-                .create(&segment_track_name)
-                .ok_or_else(|| {
-                    gst::error!(CAT, obj = self.obj(), "Failed to create track writer");
-                    gst::StateChangeError
-                })?;
+            let track_writer = state.broadcast.create(&segment_track_name).ok_or_else(|| {
+                gst::error!(CAT, obj = self.obj(), "Failed to create track writer");
+                gst::StateChangeError
+            })?;
 
             track.init_track_name = Some(init_track_name);
             track.segment_track_name = Some(segment_track_name);
@@ -748,10 +753,9 @@ impl MoqPublisher {
         let mut track_data = self.track_data.lock().unwrap();
 
         for (pad_name, track) in track_data.iter_mut() {
-            let media_info = track
-                .media_info
-                .as_ref()
-                .ok_or_else(|| anyhow::anyhow!("Missing media info for track on pad {}", pad_name))?;
+            let media_info = track.media_info.as_ref().ok_or_else(|| {
+                anyhow::anyhow!("Missing media info for track on pad {}", pad_name)
+            })?;
 
             let mut selection_params = moq_catalog::SelectionParam::default();
 
@@ -775,7 +779,7 @@ impl MoqPublisher {
             let catalog_track = moq_catalog::Track {
                 init_track: track.init_track_name.clone(),
                 name: track.segment_track_name.clone().unwrap(),
-                namespace: Some(state.broadcast.namespace.clone()),
+                namespace: Some(state.broadcast.namespace.to_utf8_path()),
                 packaging: Some(moq_catalog::TrackPackaging::Cmaf),
                 render_group: Some(1),
                 selection_params,
@@ -899,9 +903,10 @@ impl MoqPublisher {
             .segment_track
             .as_mut()
             .expect("track writer not initialized")
-            .create(serve::Group {
+            .create(serve::Subgroup {
                 group_id: segment_sequence,
                 priority: priority.unwrap_or(127),
+                subgroup_id: 0,
             })?;
 
         // Write all buffers
