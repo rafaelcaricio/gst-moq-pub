@@ -26,9 +26,9 @@ web-transport-quinn = "0.3.3"
 url = "2.5.2"
 once_cell = "1.20.2"
 http = "1.1"
-moq-transport = { git = "https://github.com/englishm/moq-rs.git", rev = "fefb38f788af14146ab44ec8f06aa1931dcaeed5" }
-moq-catalog = { git = "https://github.com/englishm/moq-rs.git", rev = "fefb38f788af14146ab44ec8f06aa1931dcaeed5" }
-moq-native-ietf = { git = "https://github.com/englishm/moq-rs.git", rev = "fefb38f788af14146ab44ec8f06aa1931dcaeed5" }
+moq-transport = { git = "https://github.com/englishm/moq-rs.git", rev = "ebc843de8504e37d36c3134a1181513ebdf7a34a" }
+moq-catalog = { git = "https://github.com/englishm/moq-rs.git", rev = "ebc843de8504e37d36c3134a1181513ebdf7a34a" }
+moq-native-ietf = { git = "https://github.com/englishm/moq-rs.git", rev = "ebc843de8504e37d36c3134a1181513ebdf7a34a" }
 serde_json = "1.0"
 anyhow = "1.0"
 

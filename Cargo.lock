@@ -1218,16 +1218,16 @@ dependencies = [
 
 [[package]]
 name = "moq-catalog"
-version = "0.2.1"
-source = "git+https://github.com/englishm/moq-rs.git?rev=fefb38f788af14146ab44ec8f06aa1931dcaeed5#fefb38f788af14146ab44ec8f06aa1931dcaeed5"
+version = "0.2.2"
+source = "git+https://github.com/englishm/moq-rs.git?rev=ebc843de8504e37d36c3134a1181513ebdf7a34a#ebc843de8504e37d36c3134a1181513ebdf7a34a"
 dependencies = [
  "serde",
 ]
 
 [[package]]
 name = "moq-native-ietf"
-version = "0.5.2"
-source = "git+https://github.com/englishm/moq-rs.git?rev=fefb38f788af14146ab44ec8f06aa1931dcaeed5#fefb38f788af14146ab44ec8f06aa1931dcaeed5"
+version = "0.5.4"
+source = "git+https://github.com/englishm/moq-rs.git?rev=ebc843de8504e37d36c3134a1181513ebdf7a34a#ebc843de8504e37d36c3134a1181513ebdf7a34a"
 dependencies = [
  "anyhow",
  "clap",
@@ -1249,8 +1249,8 @@ dependencies = [
 
 [[package]]
 name = "moq-transport"
-version = "0.8.1"
-source = "git+https://github.com/englishm/moq-rs.git?rev=fefb38f788af14146ab44ec8f06aa1931dcaeed5#fefb38f788af14146ab44ec8f06aa1931dcaeed5"
+version = "0.10.0"
+source = "git+https://github.com/englishm/moq-rs.git?rev=ebc843de8504e37d36c3134a1181513ebdf7a34a#ebc843de8504e37d36c3134a1181513ebdf7a34a"
 dependencies = [
  "bytes",
  "futures",
